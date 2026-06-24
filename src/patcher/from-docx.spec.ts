@@ -1,6 +1,7 @@
 import JSZip from "jszip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { LevelFormat } from "@file/numbering";
 import { ExternalHyperlink, ImageRun, Paragraph, TextRun } from "@file/paragraph";
 
 import { PatchType, patchDocument } from "./from-docx";
@@ -296,6 +297,63 @@ describe("from-docx", () => {
                     patches: {},
                 });
                 expect(output).to.not.be.undefined;
+            });
+
+            it("should patch document paragraphs with numbering definitions", async () => {
+                const zip = new JSZip();
+
+                zip.file("word/document.xml", MOCK_XML);
+                zip.file(
+                    "word/_rels/document.xml.rels",
+                    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"></Relationships>`,
+                );
+                zip.file(
+                    "[Content_Types].xml",
+                    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>`,
+                );
+
+                const output = await patchDocument({
+                    outputType: "nodebuffer",
+                    data: zip,
+                    numbering: {
+                        config: [
+                            {
+                                reference: "article-clause",
+                                levels: [
+                                    {
+                                        level: 0,
+                                        format: LevelFormat.DECIMAL,
+                                        text: "%1.",
+                                    },
+                                ],
+                            },
+                        ],
+                    },
+                    patches: {
+                        // eslint-disable-next-line @typescript-eslint/naming-convention
+                        paragraph_replace: {
+                            type: PatchType.DOCUMENT,
+                            children: [
+                                new Paragraph({
+                                    numbering: { reference: "article-clause", level: 0, instance: 1 },
+                                    children: [new TextRun("本文")],
+                                }),
+                            ],
+                        },
+                    },
+                });
+                const patched = await new JSZip().loadAsync(output);
+                const documentXml = await patched.file("word/document.xml")?.async("string");
+                const numberingXml = await patched.file("word/numbering.xml")?.async("string");
+                const relsXml = await patched.file("word/_rels/document.xml.rels")?.async("string");
+                const contentTypesXml = await patched.file("[Content_Types].xml")?.async("string");
+
+                expect(documentXml).not.toContain("{article-clause-1}");
+                expect(documentXml).toContain("<w:numPr>");
+                expect(numberingXml).toContain("<w:numbering");
+                expect(numberingXml).toContain('<w:lvlText w:val="%1."/>');
+                expect(relsXml).toContain("officeDocument/2006/relationships/numbering");
+                expect(contentTypesXml).toContain('PartName="/word/numbering.xml"');
             });
 
             it("should skiup UTF-16 types", async () => {

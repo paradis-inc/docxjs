@@ -94,5 +94,16 @@ export const patchSpaceAttribute = (element: Element): Element => ({
  * ```
  */
 // eslint-disable-next-line functional/prefer-readonly-type
-export const getFirstLevelElements = (relationships: Element, id: string): Element[] =>
-    relationships.elements?.filter((e) => e.name === id)[0].elements ?? [];
+export const getFirstLevelElements = (relationships: Element, id: string): Element[] => {
+    const element = relationships.elements?.filter((e) => e.name === id)[0];
+    if (!element) {
+        return [];
+    }
+
+    if (!element.elements) {
+        // eslint-disable-next-line functional/immutable-data
+        element.elements = [];
+    }
+
+    return element.elements;
+};

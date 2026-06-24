@@ -7,14 +7,18 @@
  * @module
  */
 import JSZip from "jszip";
+import xml from "xml";
 import { type Element, js2xml } from "xml-js";
 
+import { Formatter } from "@export/formatter";
 import { ImageReplacer } from "@export/packer/image-replacer";
+import { NumberingReplacer } from "@export/packer/numbering-replacer";
 import { DocumentAttributeNamespaces } from "@file/document";
 import type { IViewWrapper } from "@file/document-wrapper";
 import type { File } from "@file/file";
 import type { FileChild } from "@file/file-child";
 import { type IMediaData, Media } from "@file/media";
+import { type INumberingOptions, Numbering } from "@file/numbering";
 import { ConcreteHyperlink, ExternalHyperlink, type ParagraphChild } from "@file/paragraph";
 import { TargetModeType } from "@file/relationships/relationship/relationship";
 import type { IContext } from "@file/xml-components";
@@ -24,7 +28,7 @@ import type { OutputByType, OutputType } from "@util/output-type";
 import { appendContentType } from "./content-types-manager";
 import { appendRelationship, getNextRelationshipIndex } from "./relationship-manager";
 import { replacer } from "./replacer";
-import { toJson } from "./util";
+import { getFirstLevelElements, toJson } from "./util";
 
 /**
  * Supported input data types for document patching.
@@ -130,11 +134,17 @@ export type PatchDocumentOptions<T extends PatchDocumentOutputType = PatchDocume
     }>;
     /** Search for multiple occurrences after patching (default: true) */
     readonly recursive?: boolean;
+    /** Numbering definitions available to patched Paragraph instances. */
+    readonly numbering?: INumberingOptions;
 };
 
 const imageReplacer = new ImageReplacer();
+const numberingReplacer = new NumberingReplacer();
+const formatter = new Formatter();
 const UTF16LE = new Uint8Array([0xff, 0xfe]);
 const UTF16BE = new Uint8Array([0xfe, 0xff]);
+const NUMBERING_RELATIONSHIP_TYPE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/numbering";
+const NUMBERING_CONTENT_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml";
 
 const compareByteArrays = (a: Uint8Array, b: Uint8Array): boolean => {
     if (a.length !== b.length) {
@@ -147,6 +157,28 @@ const compareByteArrays = (a: Uint8Array, b: Uint8Array): boolean => {
     }
     return true;
 };
+
+const appendOverrideContentType = (element: Element, partName: string, contentType: string): void => {
+    const typeElements = getFirstLevelElements(element, "Types");
+    const exists = typeElements.some((el) => el.type === "element" && el.name === "Override" && el.attributes?.PartName === partName);
+    if (exists) {
+        return;
+    }
+    // eslint-disable-next-line functional/immutable-data
+    typeElements.push({
+        attributes: {
+            PartName: partName,
+            ContentType: contentType,
+        },
+        name: "Override",
+        type: "element",
+    });
+};
+
+const hasRelationshipType = (relationships: Element, type: string): boolean =>
+    getFirstLevelElements(relationships, "Relationships").some(
+        (el) => el.type === "element" && el.name === "Relationship" && el.attributes?.Type === type,
+    );
 
 /**
  * Patches an existing .docx document by replacing placeholders with new content.
@@ -193,11 +225,13 @@ export const patchDocument = async <T extends PatchDocumentOutputType = PatchDoc
      * Search for occurrences over patched document
      */
     recursive = true,
+    numbering,
 }: PatchDocumentOptions<T>): Promise<OutputByType[T]> => {
     const zipContent = data instanceof JSZip ? data : await JSZip.loadAsync(data);
     const contexts = new Map<string, IContext>();
     const file = {
         Media: new Media(),
+        Numbering: new Numbering(numbering ? numbering : { config: [] }),
     } as unknown as File;
 
     const map = new Map<string, Element>();
@@ -388,12 +422,47 @@ export const patchDocument = async <T extends PatchDocumentOutputType = PatchDoc
         appendContentType(contentTypesJson, "image/svg+xml", "svg");
     }
 
+    const hasNumbering = file.Numbering.ConcreteNumbering.length > 1;
+    if (hasNumbering) {
+        const relationshipsJson = map.get("word/_rels/document.xml.rels") ?? createRelationshipFile();
+        // eslint-disable-next-line functional/immutable-data
+        map.set("word/_rels/document.xml.rels", relationshipsJson);
+        if (!hasRelationshipType(relationshipsJson, NUMBERING_RELATIONSHIP_TYPE)) {
+            appendRelationship(
+                relationshipsJson,
+                getNextRelationshipIndex(relationshipsJson),
+                NUMBERING_RELATIONSHIP_TYPE,
+                "numbering.xml",
+            );
+        }
+
+        const contentTypesJson = map.get("[Content_Types].xml");
+        if (!contentTypesJson) {
+            throw new Error("Could not find content types file");
+        }
+        appendOverrideContentType(contentTypesJson, "/word/numbering.xml", NUMBERING_CONTENT_TYPE);
+    }
+
     const zip = new JSZip();
 
     for (const [key, value] of map) {
-        const output = toXml(value);
+        const output = numberingReplacer.replace(toXml(value), file.Numbering.ConcreteNumbering);
 
         zip.file(key, encodeUtf8(output));
+    }
+
+    if (hasNumbering) {
+        zip.file(
+            "word/numbering.xml",
+            encodeUtf8(
+                xml(formatter.format(file.Numbering, { viewWrapper: {} as IViewWrapper, file, stack: [] }), {
+                    declaration: {
+                        standalone: "yes",
+                        encoding: "UTF-8",
+                    },
+                }),
+            ),
+        );
     }
 
     for (const [key, value] of binaryContentMap) {
